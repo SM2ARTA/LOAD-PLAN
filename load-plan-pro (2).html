@@ -1,0 +1,1570 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Load Plan Pro</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#f1f5f9;color:#1e293b;font-family:'Segoe UI',system-ui,sans-serif;font-size:13px}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:#f1f5f9}
+::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px}
+input[type=date]::-webkit-calendar-picker-indicator{opacity:0.5}
+input[type=number]::-webkit-inner-spin-button{opacity:0.4}
+select,input,button{font-family:inherit}
+.tbl-scroll{overflow-x:auto}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useMemo, useCallback, useEffect, useRef } = React;
+
+const MAX_PALLETS     = 26;
+const MAX_TRUCKS_DAY  = 4;
+const MAX_TRUCKS_DEST = 2;
+const MAX_DESTS_DAY   = 2;  // max distinct destinations per dispatch day
+
+/* Warehouse colours — lighter palette for light theme */
+const WH_COLORS = {
+  "MEX CDMX":"#d97706","MEX GDL":"#ea580c","MEX MTY":"#dc2626",
+  "CAN TOR":"#2563eb","CAN VAN":"#0891b2","USA":"#059669",
+};
+const getWHColor = d => {
+  if(!d) return "#64748b";
+  const u = d.toUpperCase();
+  for(const [k,v] of Object.entries(WH_COLORS)) if(u.includes(k)) return v;
+  return "#7c3aed";
+};
+
+/* ── Date helpers ─────────────────────────────────────────────────────────── */
+// Parse a YYYY-MM-DD string into a local Date at noon (avoids UTC/timezone shift)
+const parseLocalDate = s => {
+  if(!s||s==='—') return null;
+  const [y,m,d] = String(s).split('-').map(Number);
+  return new Date(y, m-1, d, 12, 0, 0); // local noon — never shifts across day boundary
+};
+const fmtDate = d => {
+  if(!d) return "—";
+  const dt = d instanceof Date ? d : parseLocalDate(String(d));
+  if(!dt||isNaN(dt)) return String(d);
+  const y=dt.getFullYear(), m=String(dt.getMonth()+1).padStart(2,'0'), day=String(dt.getDate()).padStart(2,'0');
+  return `${y}-${m}-${day}`;
+};
+const addDays = (s,n) => { const d=parseLocalDate(s); if(!d) return s; d.setDate(d.getDate()+n); return fmtDate(d); };
+const isWeekend = s => { const d=parseLocalDate(s); return d ? d.getDay()===0||d.getDay()===6 : false; };
+
+// US Federal Holidays — covers 2025 and 2026
+const US_HOLIDAYS = new Set([
+  // 2025
+  "2025-01-01","2025-01-20","2025-02-17","2025-05-26",
+  "2025-06-19","2025-07-04","2025-09-01","2025-10-13",
+  "2025-11-11","2025-11-27","2025-12-25",
+  // 2026
+  "2026-01-01","2026-01-19","2026-02-16","2026-05-25",
+  "2026-06-19","2026-07-03","2026-09-07","2026-10-12",
+  "2026-11-11","2026-11-26","2026-12-25",
+]);
+const isHoliday = s => US_HOLIDAYS.has(s);
+const isNonWorkday = s => isWeekend(s) || isHoliday(s);
+const nextWorkday = s => { let d=s; while(isNonWorkday(d)) d=addDays(d,1); return d; };
+
+/* ── Design tokens ──────────────────────────────────────────────────────────*/
+const C = {
+  bg:"#f1f5f9", surface:"#ffffff", border:"#e2e8f0",
+  borderStrong:"#cbd5e1", muted:"#64748b", subtle:"#94a3b8",
+  text:"#1e293b", textSec:"#475569",
+  blue:"#2563eb", blueLight:"#eff6ff", blueBorder:"#bfdbfe",
+  green:"#16a34a", greenLight:"#f0fdf4", greenBorder:"#bbf7d0",
+  amber:"#d97706", amberLight:"#fffbeb", amberBorder:"#fde68a",
+  red:"#dc2626",   redLight:"#fef2f2",   redBorder:"#fecaca",
+};
+const S = {
+  card:{background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,padding:20,boxShadow:"0 1px 3px #0000000a"},
+  input:{background:C.surface,color:C.text,border:`1px solid ${C.borderStrong}`,borderRadius:6,
+         padding:"7px 11px",fontSize:12,outline:"none",width:"100%"},
+  th:{padding:"9px 13px",textAlign:"left",color:C.muted,fontSize:11,
+      letterSpacing:"0.06em",fontWeight:600,whiteSpace:"nowrap",
+      background:"#f8fafc",borderBottom:`1px solid ${C.border}`},
+  td:{padding:"8px 13px",fontSize:12,borderBottom:`1px solid ${C.border}`},
+};
+const btn = (active,danger) => ({
+  background: danger?"#fef2f2":active?"#eff6ff":"#ffffff",
+  color: danger?C.red:active?C.blue:C.textSec,
+  border:`1px solid ${danger?C.redBorder:active?C.blueBorder:C.border}`,
+  borderRadius:6,padding:"6px 12px",fontSize:12,cursor:"pointer",fontFamily:"inherit",fontWeight:active?600:400,
+});
+const Badge = ({color,bg,children,small}) => (
+  <span style={{background:bg||color+"18",color,border:`1px solid ${color}33`,
+    borderRadius:4,padding:small?"1px 7px":"3px 9px",
+    fontSize:small?10:11,fontWeight:600,letterSpacing:"0.03em",whiteSpace:"nowrap",display:"inline-block"}}>
+    {children}
+  </span>
+);
+const TabBtn = ({active,onClick,children}) => (
+  <button onClick={onClick} style={{
+    background:active?C.surface:"transparent",color:active?C.blue:C.muted,
+    border:"none",borderBottom:`2px solid ${active?C.blue:"transparent"}`,
+    padding:"10px 16px",cursor:"pointer",fontFamily:"inherit",
+    fontSize:12,fontWeight:active?700:500,letterSpacing:"0.04em",textTransform:"uppercase"}}>
+    {children}
+  </button>
+);
+const CapBar = ({value,max=MAX_PALLETS}) => {
+  const pct=Math.min(100,(value/max)*100);
+  const color=pct>95?C.green:pct>70?C.amber:pct>40?C.blue:C.red;
+  return (
+    <div style={{display:"flex",alignItems:"center",gap:6}}>
+      <div style={{flex:1,height:5,background:C.border,borderRadius:99,overflow:"hidden"}}>
+        <div style={{width:`${pct}%`,height:"100%",background:color,borderRadius:99}}/>
+      </div>
+      <span style={{fontSize:10,color,fontWeight:700,minWidth:30,textAlign:"right"}}>{value.toFixed(1)}</span>
+    </div>
+  );
+};
+const DropZone = ({label,hint,onFile,loaded,fileName}) => {
+  const [drag,setDrag]=useState(false);
+  const ref=useRef();
+  const handle=f=>{
+    if(!f) return;
+    const r=new FileReader();
+    r.onload=e=>onFile(e.target.result,f.name);
+    r.readAsArrayBuffer(f);
+  };
+  return (
+    <div onClick={()=>ref.current.click()}
+      onDragOver={e=>{e.preventDefault();setDrag(true)}}
+      onDragLeave={()=>setDrag(false)}
+      onDrop={e=>{e.preventDefault();setDrag(false);handle(e.dataTransfer.files[0])}}
+      style={{border:`2px dashed ${drag?C.blue:loaded?C.green:C.borderStrong}`,
+        borderRadius:10,padding:"20px",cursor:"pointer",textAlign:"center",
+        background:drag?C.blueLight:loaded?C.greenLight:C.surface,transition:"all .15s"}}>
+      <input ref={ref} type="file" accept=".xlsx,.xlsm,.xls,.csv" style={{display:"none"}}
+        onChange={e=>handle(e.target.files[0])}/>
+      <div style={{fontSize:22,marginBottom:5}}>{loaded?"✅":"📂"}</div>
+      <div style={{fontSize:12,fontWeight:600,color:loaded?C.green:C.text,wordBreak:"break-all"}}>
+        {loaded?fileName:label}
+      </div>
+      <div style={{fontSize:11,color:C.muted,marginTop:3}}>{loaded?"Click to replace":hint}</div>
+    </div>
+  );
+};
+
+/* ── Excel date helper ───────────────────────────────────────────────────── */
+const parseExcelDate = v => {
+  if(!v) return null;
+  if(v instanceof Date){
+    // JS Date from SheetJS — extract local date parts directly
+    const y=v.getFullYear(),m=String(v.getMonth()+1).padStart(2,'0'),d=String(v.getDate()).padStart(2,'0');
+    return `${y}-${m}-${d}`;
+  }
+  if(typeof v==="number"){
+    // Excel serial date — convert via UTC then extract parts
+    const utc=new Date(Math.round((v-25569)*86400*1000));
+    const y=utc.getUTCFullYear(),m=String(utc.getUTCMonth()+1).padStart(2,'0'),d=String(utc.getUTCDate()).padStart(2,'0');
+    return `${y}-${m}-${d}`;
+  }
+  // String date — parse parts directly
+  const s=String(v).trim();
+  const m=s.match(/(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+  if(m) return `${m[1]}-${String(m[2]).padStart(2,'0')}-${String(m[3]).padStart(2,'0')}`;
+  return null;
+};
+const makeGC = headers => (...keys) => {
+  for(const k of keys){
+    const i=headers.findIndex(h=>h===k); if(i>=0) return i;  // exact match first
+  }
+  for(const k of keys){
+    const i=headers.findIndex(h=>h.includes(k)); if(i>=0) return i; // then partial
+  }
+  return -1;
+};
+
+/* ── Parsers ─────────────────────────────────────────────────────────────── */
+/* ── File auto-detector ──────────────────────────────────────────────────── */
+const detectFileType = rows => {
+  // Look at first non-empty row's headers
+  let hr=0;
+  for(let i=0;i<Math.min(5,rows.length);i++){
+    if(rows[i].some(c=>String(c).trim())) { hr=i; break; }
+  }
+  const h = rows[hr].map(c=>String(c).trim().toLowerCase());
+  const has = s => h.some(c=>c.includes(s));
+  if(has("planned delivery date") || has("planned delivery"))           return "arrivals";
+  if(has("pallet quantity, disassembled") || has("pallet spaces"))      return "nomenclature";
+  if(has("venue cluster") || has("required"))                           return "materialplan";
+  // Fallbacks
+  if(has("arrival") && has("nomenclature code"))                        return "arrivals";
+  if(has("pallet quantity") && has("pallet spaces"))                    return "nomenclature";
+  if(has("destination") && has("qty"))                                  return "materialplan";
+  return "unknown";
+};
+
+/* ── FF&E Arrivals parser ────────────────────────────────────────────────── */
+// Columns: Planned Delivery Date | Nomenclature code | Nomenclature name | Pallets | Qty
+const parseMaterialPlan = buf => {
+  const wb=XLSX.read(buf,{type:"array",cellDates:true});
+  const ws=wb.Sheets[wb.SheetNames[0]];
+  const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:""});
+  let hr=0;
+  for(let i=0;i<Math.min(10,rows.length);i++){
+    const r=rows[i].map(c=>String(c).trim().toLowerCase());
+    if(r.some(c=>c.includes("venue cluster")||c.includes("destination")||c.includes("required"))){hr=i;break;}
+  }
+  const headers=rows[hr].map(c=>String(c).trim().toLowerCase());
+  const gc=makeGC(headers);
+  // Exact column names from Material Plan file
+  const idCol   = gc("id","unique id","line no","no.");
+  const destCol = gc("venue cluster","destination","warehouse","venue");
+  const skuCol  = gc("nomenclature","nomenclature code","sku","code","item");
+  const qtyCol  = gc("required","qty","quantity","units");
+  if(destCol<0||skuCol<0) throw new Error("Cannot find Venue cluster and Nomenclature columns. Headers found: "+headers.slice(0,10).join(", "));
+  const demand=[];
+  for(let i=hr+1;i<rows.length;i++){
+    const row=rows[i];
+    const dest=String(row[destCol]||"").trim();
+    const sku =String(row[skuCol]||"").trim();
+    if(!dest||!sku) continue;
+    const qty=qtyCol>=0?(parseFloat(row[qtyCol])||0):0;
+    const uid=idCol>=0?String(row[idCol]||"").trim():`R${i}`;
+    demand.push({uid, destination:dest, sku, name:sku, requiredQty:qty, rawPallets:0, inputMode:"qty"});
+  }
+  return demand;
+};
+
+/* ── Nomenclature parser ─────────────────────────────────────────────────── */
+// Columns: Nomenclature code | Pallet quantity, disassembled | Pallet spaces, disassembled
+const parseNomenclature = buf => {
+  const wb=XLSX.read(buf,{type:"array",cellDates:true});
+  const ws=wb.Sheets[wb.SheetNames[0]];
+  const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:""});
+  let hr=0;
+  for(let i=0;i<Math.min(10,rows.length);i++){
+    const r=rows[i].map(c=>String(c).trim().toLowerCase());
+    if(r.some(c=>c.includes("nomenclature")||c.includes("pallet"))){hr=i;break;}
+  }
+  const headers=rows[hr].map(c=>String(c).trim().toLowerCase());
+  const gc=makeGC(headers);
+  // Exact column names from Nomenclature file
+  const skuCol      = gc("nomenclature code","sku","code");
+  const nameCol     = gc("nomenclature name","name","description");
+  const palletQtyCol= gc("pallet quantity, disassembled","pallet quantity","pallet qty","units per pallet");
+  const palletSpcCol= gc("pallet spaces, disassembled","pallet spaces","spaces","pallet space");
+  if(skuCol<0) throw new Error("Cannot find Nomenclature code column. Headers found: "+headers.slice(0,8).join(", "));
+  const nomen={};
+  for(let i=hr+1;i<rows.length;i++){
+    const row=rows[i];
+    const sku=String(row[skuCol]||"").trim();
+    if(!sku) continue;
+    nomen[sku]={
+      name:     nameCol>=0     ?String(row[nameCol]||"").trim():"",
+      palletQty:palletQtyCol>=0?(parseFloat(row[palletQtyCol])||1):1,
+      palletSpc:palletSpcCol>=0?(parseFloat(row[palletSpcCol])||1):1,
+    };
+  }
+  return nomen;
+};
+
+/* ── FF&E Arrivals parser ────────────────────────────────────────────────── */
+// Columns: Planned Delivery Date | Nomenclature code | Nomenclature name | Pallets | Qty
+const parseArrivals = (buf,turnaround) => {
+  const wb=XLSX.read(buf,{type:"array",cellDates:true});
+  const ws=wb.Sheets[wb.SheetNames[0]];
+  const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:""});
+  let hr=0;
+  for(let i=0;i<Math.min(10,rows.length);i++){
+    const r=rows[i].map(c=>String(c).trim().toLowerCase());
+    if(r.some(c=>c.includes("planned delivery")||c.includes("arrival")||c.includes("nomenclature code"))){hr=i;break;}
+  }
+  const headers=rows[hr].map(c=>String(c).trim().toLowerCase());
+  const gc=makeGC(headers);
+  // Exact column names from FF&E Arrival file
+  const arrCol     = gc("planned delivery date","planned delivery","expected arrival date","arrival date","arrival");
+  const skuCol     = gc("nomenclature code","sku","code");
+  const nameCol    = gc("nomenclature name","name","description");
+  const palletsCol = gc("pallets","expected pallet qty","pallet qty","pallet");
+  const qtyCol     = headers.findIndex(h=>h==="qty"||h==="quantity"); // exact match only
+  if(arrCol<0||skuCol<0) throw new Error("Cannot find Planned Delivery Date and Nomenclature code columns. Headers found: "+headers.slice(0,8).join(", "));
+  const arrivals=[];
+  for(let i=hr+1;i<rows.length;i++){
+    const row=rows[i];
+    const sku=String(row[skuCol]||"").trim();
+    if(!sku||sku.toLowerCase()==="total") continue;
+    const arrDate=parseExcelDate(row[arrCol]);
+    if(!arrDate||arrDate==="—") continue;
+    const rawReady=addDays(arrDate,turnaround);
+    const readyDate=nextWorkday(rawReady);
+    const qty=qtyCol>=0?(parseFloat(row[qtyCol])||0):0;
+    arrivals.push({
+      sku,
+      name:        nameCol>=0   ?String(row[nameCol]||"").trim():"",
+      arrivalDate: arrDate,
+      readyDate,
+      availPallets:palletsCol>=0?(parseFloat(row[palletsCol])||0):0,
+      container:   "",
+      qty,
+    });
+  }
+  return arrivals;
+};
+
+/* ── Planning Engine ─────────────────────────────────────────────────────
+   WAREHOUSE MODEL:
+   - Stock report = cumulative available units per SKU per day (inbound + turnaround)
+   - Each workday: check if stock covers a full truck (26 pal) to any destination
+   - Allocate outbound greedily: fill full trucks (whole pallets only) from oldest demand first
+   - Track allocated qty per SKU — never exceed demand
+   - A destination dispatches when stock allows a full truck OR it's the last batch
+   - Multiple trucks per day allowed up to MAX_TRUCKS_DAY / MAX_TRUCKS_DEST limits
+   ───────────────────────────────────────────────────────────────────────── */
+function buildLoadPlan(demand, arrivals) {
+  if(!demand.length||!arrivals.length) return [];
+
+  // ── Nomenclature helpers ──
+  const nomMap={};
+  for(const d of demand) if(!nomMap[d.sku]) nomMap[d.sku]={palletQty:d.palletQty||1,palletSpc:d.palletSpc||1,name:d.name};
+  const upp = sku => { const m=nomMap[sku]||{palletQty:1,palletSpc:1}; return m.palletQty/m.palletSpc; }; // units per pallet space
+  const u2spc = (sku,qty) => { const u=upp(sku); return u>0 ? qty/u : 0; };              // fractional spaces
+  const floorPallets = (sku,qty) => Math.floor(qty/( nomMap[sku]?.palletQty||1 )) * (nomMap[sku]?.palletSpc||1); // whole spaces
+
+  // ── Inventory: cumulative stock per SKU, added on readyDate ──
+  const invEvents = [...arrivals.filter(a=>a.qty>0)].sort((a,b)=>a.readyDate.localeCompare(b.readyDate));
+  if(!invEvents.length) return [];
+
+  const stockDelta = {}; // date -> sku -> qty arriving that day
+  for(const a of invEvents){
+    if(!stockDelta[a.readyDate]) stockDelta[a.readyDate]={};
+    stockDelta[a.readyDate][a.sku] = (stockDelta[a.readyDate][a.sku]||0) + a.qty;
+  }
+  const lastInvDate = invEvents[invEvents.length-1].readyDate;
+
+  // ── Demand: per dest+sku, ordered list of source IDs ──
+  // remainDemand tracks how many units still need to be shipped
+  const isTruck = d => { const u=(d||'').toUpperCase(); return u.includes('MEX')||u.includes('CAN'); };
+  const pri = d => { const u=(d||'').toUpperCase(); return u.includes('MEX')?0:u.includes('CAN')?1:2; };
+
+  // ── Only plan SKUs that have known arrivals ──
+  const arrivedSkus = new Set(invEvents.map(a=>a.sku));
+
+  // demandQueue[dest][sku] = [{id, qty, remain}] — source IDs in order
+  const demandQueue = {};
+  // remainDemand[dest][sku] = total units still unshipped
+  const remainDemand = {};
+
+  for(const d of demand){
+    if(!isTruck(d.destination)) continue;
+    if(!arrivedSkus.has(d.sku)) continue;  // skip SKUs with no arrivals
+    if(!demandQueue[d.destination]) demandQueue[d.destination]={};
+    if(!demandQueue[d.destination][d.sku]) demandQueue[d.destination][d.sku]=[];
+    if(!remainDemand[d.destination]) remainDemand[d.destination]={};
+    if(!remainDemand[d.destination][d.sku]) remainDemand[d.destination][d.sku]=0;
+    for(const src of (d.sourceIds||[])){
+      demandQueue[d.destination][d.sku].push({id:src.id, qty:src.qty, remain:src.qty});
+      remainDemand[d.destination][d.sku] += src.qty;
+    }
+  }
+
+  // ── Total inventory available per SKU (hard cap — can't ship more than arrived) ──
+  const totalInv = {};
+  for(const a of invEvents) totalInv[a.sku] = (totalInv[a.sku]||0) + a.qty;
+
+  // Cap total remainDemand per SKU across all dests to totalInv
+  // Distribute cap proportionally across destinations
+  for(const sku of arrivedSkus){
+    const cap = totalInv[sku]||0;
+    let totalDem = 0;
+    for(const dest of Object.keys(remainDemand))
+      totalDem += remainDemand[dest]?.[sku]||0;
+    if(totalDem <= cap) continue; // no cap needed
+    // Scale down each dest proportionally
+    const ratio = cap/totalDem;
+    for(const dest of Object.keys(demandQueue)){
+      if(!demandQueue[dest][sku]) continue;
+      let destAlloc = Math.floor((remainDemand[dest][sku]||0) * ratio);
+      // Snap down to whole-pallet multiple
+      const pq = nomMap[sku]?.palletQty||1;
+      destAlloc = Math.floor(destAlloc/pq)*pq;
+      remainDemand[dest][sku] = destAlloc;
+      // Trim demandQueue to match
+      let keep = destAlloc;
+      demandQueue[dest][sku] = demandQueue[dest][sku].filter(item=>{
+        if(keep<=0) return false;
+        if(item.qty<=keep){ keep-=item.qty; return true; }
+        item.remain=keep; item.qty=keep; keep=0; return true;
+      });
+    }
+  }
+
+  // ── Cumulative stock (shared pool across all dests) ──
+  const stock = {}; // sku -> available units
+
+  // ── Iterate workdays ──
+  const iterDates=[];
+  let cur=invEvents[0].readyDate;
+  for(let i=0;i<365;i++){ if(!isNonWorkday(cur)) iterDates.push(cur); cur=addDays(cur,1); }
+
+  const plan=[];
+  let truckId=0;
+
+  const totalRemain = () => Object.values(remainDemand).reduce((s,d)=>s+Object.values(d).reduce((a,b)=>a+b,0),0);
+
+  for(const date of iterDates){
+    // 1. Add today's arrivals to stock
+    if(stockDelta[date])
+      for(const [sku,qty] of Object.entries(stockDelta[date]))
+        stock[sku] = (stock[sku]||0) + qty;
+
+    if(totalRemain()<=0) break;
+
+    // 2. For each destination (fullest potential load first), try to dispatch trucks
+    // Score each dest by how many full pallet spaces it can load TODAY from stock
+    const destScores = {};
+    for(const dest of Object.keys(demandQueue)){
+      let score=0;
+      for(const [sku,items] of Object.entries(demandQueue[dest])){
+        const rem = remainDemand[dest][sku]||0;
+        if(rem<=0) continue;
+        const avail = Math.min(rem, stock[sku]||0);
+        score += floorPallets(sku, avail);
+      }
+      if(score>0) destScores[dest]=score;
+    }
+
+    // Sort: fullest load first, MEX before CAN as tiebreak
+    const dests = Object.keys(destScores).sort((a,b)=>{
+      const diff = destScores[b]-destScores[a];
+      return diff!==0 ? diff : pri(a)-pri(b);
+    });
+
+    let trucksToday=0;
+    const trucksByDest={};
+
+    // Round-robin: each round gives every eligible dest one truck, repeat until day full
+    let madeProgress=true;
+
+    // Pick today's 2 allowed destinations ONCE (highest score wins, locked for the day)
+    const allScored = Object.keys(demandQueue)
+      .map(dest=>{
+        let s=0;
+        for(const sku of Object.keys(demandQueue[dest]||{})){
+          const rem=remainDemand[dest]?.[sku]||0; if(rem<=0) continue;
+          s+=floorPallets(sku,Math.min(rem,stock[sku]||0));
+        }
+        return {dest,score:s};
+      })
+      .filter(x=>x.score>0)
+      .sort((a,b)=>b.score-a.score||pri(a.dest)-pri(b.dest));
+    const allowedDests = new Set(allScored.slice(0,MAX_DESTS_DAY).map(x=>x.dest));
+
+    while(madeProgress && trucksToday<MAX_TRUCKS_DAY){
+      madeProgress=false;
+
+      // Re-score live each round (stock changes after each truck built)
+      const scored = Object.keys(demandQueue)
+        .map(dest=>{
+          let s=0;
+          for(const sku of Object.keys(demandQueue[dest]||{})){
+            const rem=remainDemand[dest]?.[sku]||0; if(rem<=0) continue;
+            s+=floorPallets(sku,Math.min(rem,stock[sku]||0));
+          }
+          return {dest,score:s};
+        })
+        .filter(x=>x.score>0 && allowedDests.has(x.dest) && (trucksByDest[x.dest]||0)<MAX_TRUCKS_DEST)
+        .sort((a,b)=>b.score-a.score||pri(a.dest)-pri(b.dest));
+
+      for(const {dest} of scored){
+        if(trucksToday>=MAX_TRUCKS_DAY) break;
+        if((trucksByDest[dest]||0)>=MAX_TRUCKS_DEST) continue;
+
+        // What SKUs can we load right now?
+        const skus=Object.keys(demandQueue[dest])
+          .filter(sku=>(remainDemand[dest][sku]||0)>0 && (stock[sku]||0)>0)
+          .sort((a,b)=>{
+            const fa=invEvents.find(e=>e.sku===a)?.readyDate||'9999';
+            const fb=invEvents.find(e=>e.sku===b)?.readyDate||'9999';
+            return fa.localeCompare(fb);
+          });
+
+        let spacesAvail=0;
+        for(const sku of skus){
+          spacesAvail+=floorPallets(sku,Math.min(remainDemand[dest][sku]||0,stock[sku]||0));
+        }
+        if(spacesAvail<1) continue;
+
+        // Hold only if: partial load AND future stock would genuinely add uncovered pallets to reach full truck
+        if(spacesAvail<MAX_PALLETS){
+          const futureUncovered=invEvents.reduce((s,a)=>{
+            if(a.readyDate<=date) return s;
+            const rem=remainDemand[dest]?.[a.sku]||0; if(rem<=0) return s;
+            const uncovered=Math.max(0,rem-Math.min(rem,stock[a.sku]||0));
+            return s+floorPallets(a.sku,Math.min(a.qty,uncovered));
+          },0);
+          if(futureUncovered>=1 && spacesAvail+futureUncovered>=MAX_PALLETS) continue; // hold for tomorrow
+        }
+
+        // Build the truck
+        truckId++;
+        const rows=[];
+        let spacesLoaded=0;
+        for(const sku of skus){
+          if(spacesLoaded>=MAX_PALLETS) break;
+          const spacesLeft=MAX_PALLETS-spacesLoaded;
+          const canUse=Math.min(remainDemand[dest][sku]||0,stock[sku]||0);
+          const wholeSpc=Math.min(floorPallets(sku,canUse),spacesLeft);
+          if(wholeSpc<1) continue;
+          const unitsToLoad=wholeSpc*upp(sku);
+          let stillNeed=unitsToLoad;
+          const idList=demandQueue[dest][sku];
+          let ii=0;
+          while(ii<idList.length && stillNeed>0.001){
+            const item=idList[ii];
+            if(item.remain<0.001){idList.splice(ii,1);continue;}
+            const take=Math.min(item.remain,stillNeed);
+            const consumed=Math.abs(take-item.remain)<0.001;
+            rows.push({date,truckId,destination:dest,sku,
+              name:nomMap[sku]?.name||sku,id:item.id,qty:Math.round(take),
+              originalQty:item.qty,isSplit:!consumed||Math.abs(take-item.qty)>0.001,
+              pallets:u2spc(sku,take)});
+            stillNeed-=take;
+            remainDemand[dest][sku]-=take;
+            stock[sku]-=take;
+            if(consumed){idList.splice(ii,1);}else{item.remain-=take;ii++;}
+          }
+          spacesLoaded+=wholeSpc;
+        }
+        if(!rows.length){truckId--;continue;}
+        for(const r of rows) plan.push({...r,truckTotal:spacesLoaded});
+        trucksByDest[dest]=(trucksByDest[dest]||0)+1;
+        trucksToday++;
+        madeProgress=true;
+      }
+    }
+  }
+
+  // Flush any remaining demand as final partial trucks
+  const lastDate = plan.length ? plan[plan.length-1].date : iterDates[0];
+  let flushDate = nextWorkday(addDays(lastDate,1));
+  const flushDests = Object.keys(demandQueue)
+    .filter(dest=>Object.values(remainDemand[dest]||{}).some(v=>v>0.001))
+    .sort((a,b)=>pri(a)-pri(b));
+
+  for(const dest of flushDests){
+    const skus = Object.keys(demandQueue[dest])
+      .filter(sku=>(remainDemand[dest][sku]||0)>0.001)
+      .sort((a,b)=>{
+        const fa=invEvents.find(e=>e.sku===a)?.readyDate||'9999';
+        const fb=invEvents.find(e=>e.sku===b)?.readyDate||'9999';
+        return fa.localeCompare(fb);
+      });
+    if(!skus.length) continue;
+
+    // Build partial trucks until demand exhausted
+    let keepGoing=true;
+    while(keepGoing){
+      truckId++;
+      const rows=[];
+      let spacesLoaded=0;
+      keepGoing=false;
+
+      for(const sku of skus){
+        if(spacesLoaded>=MAX_PALLETS) break;
+        const m = nomMap[sku]||{palletQty:1,palletSpc:1};
+        const rem = remainDemand[dest][sku]||0;
+        if(rem<0.001) continue;
+        const spacesLeft = MAX_PALLETS-spacesLoaded;
+        const wholeSpc = Math.min(floorPallets(sku,rem), spacesLeft);
+        if(wholeSpc<1) continue;
+        const unitsToLoad = wholeSpc * upp(sku);
+        let stillNeed=unitsToLoad;
+        const idList=demandQueue[dest][sku];
+        let i=0;
+        while(i<idList.length && stillNeed>0.001){
+          const item=idList[i];
+          if(item.remain<0.001){idList.splice(i,1);continue;}
+          const take=Math.min(item.remain,stillNeed);
+          const consumed=Math.abs(take-item.remain)<0.001;
+          rows.push({date:flushDate,truckId,destination:dest,sku,
+            name:nomMap[sku]?.name||sku, id:item.id, qty:Math.round(take),
+            originalQty:item.qty, isSplit:!consumed||Math.abs(take-item.qty)>0.001,
+            pallets:u2spc(sku,take)});
+          stillNeed-=take;
+          remainDemand[dest][sku]-=take;
+          if(consumed){idList.splice(i,1);}else{item.remain-=take;i++;}
+        }
+        spacesLoaded+=wholeSpc;
+        if((remainDemand[dest][sku]||0)>0.001) keepGoing=true;
+      }
+      if(!rows.length){truckId--;break;}
+      for(const r of rows) plan.push({...r,truckTotal:spacesLoaded});
+    }
+  }
+
+  return plan;
+}
+
+/* ── localStorage helpers ────────────────────────────────────────────────── */
+const LS_KEY = 'loadPlanPro_v1';
+const lsSave = data => { try{ localStorage.setItem(LS_KEY, JSON.stringify(data)); }catch(e){} };
+const lsLoad = () => { try{ const s=localStorage.getItem(LS_KEY); return s?JSON.parse(s):null; }catch(e){ return null; } };
+
+/* ── Main App ────────────────────────────────────────────────────────────── */
+function App(){
+  // Restore from localStorage on first render
+  const saved = lsLoad();
+
+  const [tab,setTab]=useState("setup");
+  const [materialPlan,setMaterialPlan]=useState(saved?.materialPlan||[]);
+  const [nomenclature,setNomenclature]=useState(saved?.nomenclature||{});
+  const [arrivals,setArrivals]=useState(saved?.arrivals||[]);
+  const [loadedFiles,setLoadedFiles]=useState(saved?.loadedFiles||{arrivals:null,nomenclature:null,materialplan:null});
+  const [arrBufs,setArrBufs]=useState([]);
+  const [error,setError]=useState("");
+  const [planGenerated,setPlanGenerated]=useState(saved?.planGenerated||false);
+  const [turnaround,setTurnaround]=useState(saved?.turnaround||6);
+  const [planFilter,setPlanFilter]=useState({date:"",dest:"",sku:""});
+  const [showShortages,setShowShortages]=useState("all");
+  const [expandedTruck,setExpandedTruck]=useState(null);
+
+  // Persist to localStorage whenever key state changes
+  useEffect(()=>{
+    lsSave({materialPlan,nomenclature,arrivals,loadedFiles,turnaround,planGenerated});
+  },[materialPlan,nomenclature,arrivals,loadedFiles,turnaround,planGenerated]);
+
+  const processFile = useCallback((buf, name, td) => {
+    const wb=XLSX.read(buf,{type:"array",cellDates:true});
+    const ws=wb.Sheets[wb.SheetNames[0]];
+    const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:""});
+    const type=detectFileType(rows);
+    return {type, buf, name};
+  },[]);
+
+  const handleFiles = useCallback((files, td=turnaround) => {
+    setError("");
+    const results={arrivals:[],nomenclature:null,materialplan:null};
+    const names={arrivals:[],nomenclature:null,materialplan:null};
+    const errors=[];
+
+    for(const {type,buf,name} of files){
+      try{
+        if(type==="arrivals"){
+          results.arrivals.push(...parseArrivals(buf,td));
+          names.arrivals.push(name);
+        } else if(type==="nomenclature"){
+          Object.assign(results.nomenclature||(results.nomenclature={}), parseNomenclature(buf));
+          names.nomenclature=name;
+        } else if(type==="materialplan"){
+          results.materialplan=parseMaterialPlan(buf);
+          names.materialplan=name;
+        } else {
+          errors.push(`"${name}": could not detect file type`);
+        }
+      } catch(e){ errors.push(`"${name}": ${e.message}`); }
+    }
+
+    if(results.arrivals.length) setArrivals(results.arrivals);
+    if(results.nomenclature)   setNomenclature(results.nomenclature);
+    if(results.materialplan)   setMaterialPlan(results.materialplan);
+    setLoadedFiles(prev=>({
+      arrivals: names.arrivals.length ? names.arrivals.join(", ") : prev.arrivals,
+      nomenclature: names.nomenclature||prev.nomenclature,
+      materialplan: names.materialplan||prev.materialplan,
+    }));
+    if(errors.length) setError(errors.join(" | "));
+    setPlanGenerated(false);
+  },[turnaround]);
+
+  const handleUpload = useCallback((fileList, td=turnaround) => {
+    const files=[];
+    Array.from(fileList).forEach(f=>{
+      const reader=new FileReader();
+      reader.onload=e=>{
+        const buf=new Uint8Array(e.target.result);
+        const wb=XLSX.read(buf,{type:"array",cellDates:true});
+        const ws=wb.Sheets[wb.SheetNames[0]];
+        const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:""});
+        const type=detectFileType(rows);
+        files.push({type,buf,name:f.name});
+        if(files.length===fileList.length) handleFiles(files,td);
+      };
+      reader.readAsArrayBuffer(f);
+    });
+  },[handleFiles,turnaround]);
+
+  const handleTurnaroundChange=val=>{
+    const td=Math.max(1,Math.min(30,parseInt(val)||6));
+    setTurnaround(td);
+    // Re-parse arrivals with new turnaround if we have loaded files
+    if(loadedFiles.arrivals){
+      setArrivals(prev=>prev.map(a=>({
+        ...a,
+        readyDate: nextWorkday(addDays(a.arrivalDate,td))
+      })));
+      setPlanGenerated(false);
+    }
+  };
+  const updateArrivalDate=(idx,val)=>{
+    setArrivals(prev=>{ const n=[...prev]; const raw=addDays(val,turnaround); n[idx]={...n[idx],arrivalDate:val,readyDate:nextWorkday(raw)}; setPlanGenerated(false); return n; });
+  };
+
+  /* Enrich demand rows — handles both qty-mode and pallet-mode input */
+  const enrichedRows=useMemo(()=>materialPlan.map(row=>{
+    const nom=nomenclature[row.sku];
+    const palletQty=nom?.palletQty||1;
+    const palletSpc=nom?.palletSpc||1;
+    const nomName=nom?.name||row.name||row.sku;
+    let requiredQty,requiredPallets;
+    if(row.inputMode==="qty"&&row.requiredQty>0){
+      requiredQty=row.requiredQty;
+      requiredPallets=(requiredQty/palletQty)*palletSpc;
+    } else {
+      requiredPallets=row.rawPallets||0;
+      requiredQty=palletSpc>0?requiredPallets*(palletQty/palletSpc):0;
+    }
+    return{...row,nomName,requiredQty,requiredPallets,palletQty,palletSpc,nomFound:!!nom};
+  }),[materialPlan,nomenclature]);
+
+  const demandBySku=useMemo(()=>{
+    const map={};
+    for(const r of enrichedRows){
+      if(!map[r.sku]) map[r.sku]={sku:r.sku,name:r.nomName,totalQty:0,totalPallets:0,
+        destinations:new Set(),palletQty:r.palletQty,palletSpc:r.palletSpc,nomFound:r.nomFound};
+      map[r.sku].totalQty+=r.requiredQty; map[r.sku].totalPallets+=r.requiredPallets;
+      map[r.sku].destinations.add(r.destination);
+    }
+    return Object.values(map).sort((a,b)=>b.totalPallets-a.totalPallets);
+  },[enrichedRows]);
+
+  const demandForPlan=useMemo(()=>{
+    const map={};
+    for(const r of enrichedRows){
+      const k=`${r.destination}|${r.sku}`;
+      if(!map[k]) map[k]={destination:r.destination,sku:r.sku,name:r.nomName,
+        requiredPallets:0,requiredQty:0,sourceIds:[],palletQty:r.palletQty,palletSpc:r.palletSpc};
+      map[k].requiredPallets+=r.requiredPallets; map[k].requiredQty+=r.requiredQty;
+      // Each source row carries its own id+qty — never merge qtys
+      map[k].sourceIds.push({id:r.uid, qty:r.requiredQty});
+    }
+    return Object.values(map);
+  },[enrichedRows]);
+
+  const isTruckDest=d=>{ const u=(d||"").toUpperCase(); return u.includes("MEX")||u.includes("CAN"); };
+  const usaWarehouseItems=useMemo(()=>demandForPlan.filter(d=>!isTruckDest(d.destination)),[demandForPlan]);
+
+  const generatedPlan=useMemo(()=>{
+    if(!planGenerated||!demandForPlan.length||!arrivals.length) return [];
+    return buildLoadPlan(demandForPlan,arrivals);
+  },[planGenerated,demandForPlan,arrivals]);
+
+  /* Cumulative fulfillment per dest+sku */
+  const planWithFulfillment=useMemo(()=>{
+    const totMap={};
+    for(const d of demandForPlan) totMap[`${d.destination}|${d.sku}`]=d.requiredQty;
+    const cum={};
+    return generatedPlan.map(r=>{
+      const k=`${r.destination}|${r.sku}`;
+      cum[k]=(cum[k]||0)+r.qty;
+      const tot=totMap[k]||0;
+      return{...r,cumQty:cum[k],totalDemQty:tot,cumPct:tot>0?Math.min(100,(cum[k]/tot)*100):100};
+    });
+  },[generatedPlan,demandForPlan]);
+
+  const planDates=useMemo(()=>[...new Set(generatedPlan.map(r=>r.date))].sort(),[generatedPlan]);
+  const planDests=useMemo(()=>[...new Set(generatedPlan.map(r=>r.destination))].sort(),[generatedPlan]);
+
+  const filteredPlan=useMemo(()=>planWithFulfillment.filter(r=>
+    (!planFilter.date||r.date===planFilter.date)&&
+    (!planFilter.dest||r.destination===planFilter.dest)&&
+    (!planFilter.sku||r.sku.toLowerCase().includes(planFilter.sku.toLowerCase())||
+      r.name.toLowerCase().includes(planFilter.sku.toLowerCase()))
+  ),[planWithFulfillment,planFilter]);
+
+  const truckSummary=useMemo(()=>{
+    const m={};
+    for(const r of planWithFulfillment){
+      if(!m[r.truckId]) m[r.truckId]={truckId:r.truckId,date:r.date,destination:r.destination,pallets:0,qty:0,skus:new Set()};
+      m[r.truckId].pallets+=r.pallets; m[r.truckId].qty+=r.qty; m[r.truckId].skus.add(r.sku);
+    }
+    return Object.values(m).sort((a,b)=>a.date.localeCompare(b.date)||a.destination.localeCompare(b.destination));
+  },[planWithFulfillment]);
+
+  const shortages=useMemo(()=>{
+    const ap={},aq={};
+    for(const r of generatedPlan){ const k=`${r.destination}|${r.sku}`; ap[k]=(ap[k]||0)+r.pallets; aq[k]=(aq[k]||0)+r.qty; }
+    return demandForPlan.map(d=>{
+      const k=`${d.destination}|${d.sku}`;
+      return{...d,allocPallets:ap[k]||0,allocQty:aq[k]||0,
+        shortagePallets:Math.max(0,d.requiredPallets-(ap[k]||0)),
+        shortageQty:Math.max(0,d.requiredQty-(aq[k]||0))};
+    }).sort((a,b)=>b.shortagePallets-a.shortagePallets);
+  },[generatedPlan,demandForPlan]);
+
+  const filteredShortages=showShortages==="shortage"?shortages.filter(s=>s.shortagePallets>0.001)
+    :showShortages==="fulfilled"?shortages.filter(s=>s.shortagePallets<=0.001):shortages;
+
+  const totalShortage =shortages.reduce((s,r)=>s+r.shortagePallets,0);
+  const totalAllocPal =shortages.reduce((s,r)=>s+r.allocPallets,0);
+  const totalAllocQty =shortages.reduce((s,r)=>s+r.allocQty,0);
+  const totalDemandPal=demandForPlan.reduce((s,r)=>s+r.requiredPallets,0);
+  const totalDemandQty=demandForPlan.reduce((s,r)=>s+r.requiredQty,0);
+  const canGenerate   =demandForPlan.length>0&&arrivals.filter(a=>a.qty>0).length>0;
+
+  /* Export */
+  const exportPlan=()=>{
+    if(!planWithFulfillment.length) return;
+    const wb=XLSX.utils.book_new();
+    // One row per source ID — qty is exact from material plan
+    const planRows=planWithFulfillment.map(r=>({
+      "Dispatch Date":r.date,
+      "Truck #":r.truckId,
+      "Destination":r.destination,
+      "SKU":r.sku,
+      "Product Name":r.name,
+      "Material Plan ID":r.id||"",
+      "Split":r.isSplit?"YES":"",
+      "Qty (units)":r.qty,
+      "Original Qty":r.isSplit?(r.originalQty||""):"",
+      "Pallets":+r.pallets.toFixed(4),
+      "Truck Total Pallets":r.truckTotal,
+      "Total Demand Qty":Math.round(r.totalDemQty),
+      "Cumulative Alloc Qty":Math.round(r.cumQty),
+      "Fulfillment %":+r.cumPct.toFixed(1),
+    }));
+    XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(planRows),"Dispatch Plan (Detail)");
+
+    // Truck Summary — one row per truck+SKU aggregate
+    const truckSumMap={};
+    for(const r of planWithFulfillment){
+      const k=`${r.truckId}|${r.sku}`;
+      if(!truckSumMap[k]) truckSumMap[k]={
+        "Dispatch Date":r.date,"Truck #":r.truckId,
+        "Destination":r.destination,"SKU":r.sku,"Product Name":r.name,
+        "Total Qty":0,"Total Pallets":0,"Truck Total Pallets":r.truckTotal,
+      };
+      truckSumMap[k]["Total Qty"]+=r.qty;
+      truckSumMap[k]["Total Pallets"]=+(truckSumMap[k]["Total Pallets"]+r.pallets).toFixed(4);
+    }
+    const truckSumRows=Object.values(truckSumMap).sort((a,b)=>
+      a["Truck #"]-b["Truck #"]||a["SKU"].localeCompare(b["SKU"]));
+    XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(truckSumRows),"Truck Summary");
+    if(usaWarehouseItems.length){
+      const uRows=usaWarehouseItems.map(d=>({Destination:d.destination,SKU:d.sku,"Product Name":d.name,
+        "Required Qty":Math.round(d.requiredQty),"Required Pallets":+d.requiredPallets.toFixed(3),Note:"Stays at warehouse"}));
+      XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(uRows),"USA Warehouse");
+    }
+    XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(shortages.map(s=>({
+      Destination:s.destination,SKU:s.sku,Product:s.name,
+      "Req Qty":Math.round(s.requiredQty),"Alloc Qty":Math.round(s.allocQty),"Short Qty":Math.round(s.shortageQty),
+      "Req Pal":+s.requiredPallets.toFixed(3),"Alloc Pal":+s.allocPallets.toFixed(3),"Short Pal":+s.shortagePallets.toFixed(3),
+    }))),"Shortages");
+    XLSX.writeFile(wb,"load_plan_export.xlsx");
+  };
+
+  /* Save / Load session as JSON */
+  const saveSession=()=>{
+    const session={
+      version:1,
+      savedAt: new Date().toISOString(),
+      materialPlan, nomenclature, arrivals, loadedFiles, turnaround, planGenerated,
+    };
+    const blob=new Blob([JSON.stringify(session,null,2)],{type:"application/json"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    const date=new Date().toISOString().slice(0,10);
+    a.href=url; a.download=`load-plan-session-${date}.json`; a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const loadSession=file=>{
+    if(!file) return;
+    const reader=new FileReader();
+    reader.onload=e=>{
+      try{
+        const s=JSON.parse(e.target.result);
+        if(!s.version) throw new Error("Invalid session file");
+        if(s.materialPlan)  setMaterialPlan(s.materialPlan);
+        if(s.nomenclature)  setNomenclature(s.nomenclature);
+        if(s.arrivals)      setArrivals(s.arrivals);
+        if(s.loadedFiles)   setLoadedFiles(s.loadedFiles);
+        if(s.turnaround)    setTurnaround(s.turnaround);
+        setPlanGenerated(s.planGenerated||false);
+        setError("");
+        if(s.planGenerated) setTab("plan");
+      } catch(err){ setError("Could not load session: "+err.message); }
+    };
+    reader.readAsText(file);
+  };
+
+  const truckRows=expandedTruck!==null?planWithFulfillment.filter(r=>r.truckId===expandedTruck):[];
+
+  /* ── Render ── */
+  return (
+    <div style={{background:C.bg,minHeight:"100vh",color:C.text}}>
+
+      {/* Header */}
+      <div style={{background:C.surface,borderBottom:`1px solid ${C.border}`,padding:"0 24px",
+        boxShadow:"0 1px 3px #0000000d"}}>
+        <div style={{display:"flex",alignItems:"center",gap:12,padding:"14px 0 0",flexWrap:"wrap"}}>
+          <div style={{background:"linear-gradient(135deg,#2563eb,#7c3aed)",borderRadius:8,
+            padding:"7px 10px",fontSize:16,color:"#fff"}}>🚛</div>
+          <div>
+            <div style={{fontSize:15,fontWeight:700,color:C.text,letterSpacing:"-0.01em"}}>Load Plan Pro</div>
+            <div style={{fontSize:10,color:C.muted,letterSpacing:"0.08em",textTransform:"uppercase"}}>
+              FIFO · MEX→CAN trucks · TSE/USA stay at warehouse
+              {(loadedFiles.arrivals||planGenerated)&&<span style={{color:C.green,marginLeft:6}}>· 💾 auto-saved</span>}
+            </div>
+          </div>
+          <div style={{marginLeft:"auto",display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+            {planGenerated&&<>
+              {[["Trucks",truckSummary.length,C.blue],
+                ["Alloc Qty",Math.round(totalAllocQty).toLocaleString(),C.green],
+                ["Alloc Pal",totalAllocPal.toFixed(1),C.green],
+                ["Shortage",totalShortage.toFixed(1),totalShortage>0?C.red:C.green],
+              ].map(([l,v,c])=>(
+                <div key={l} style={{textAlign:"right"}}>
+                  <div style={{fontSize:10,color:C.muted,textTransform:"uppercase"}}>{l}</div>
+                  <div style={{fontSize:14,fontWeight:700,color:c}}>{v}</div>
+                </div>
+              ))}
+              <button onClick={exportPlan} style={{background:"linear-gradient(135deg,#2563eb,#7c3aed)",
+                color:"#fff",border:"none",borderRadius:7,padding:"8px 14px",
+                fontFamily:"inherit",fontSize:12,fontWeight:600,cursor:"pointer"}}>⬇ Export XLSX</button>
+            </>}
+            {/* Save / Load session — always visible */}
+            <button onClick={saveSession}
+              style={{background:C.green,color:"#fff",border:"none",borderRadius:7,padding:"8px 14px",
+                fontFamily:"inherit",fontSize:12,fontWeight:600,cursor:"pointer"}}>
+              💾 Save Session
+            </button>
+            <label style={{background:C.surface,color:C.blue,border:`1px solid ${C.blue}`,borderRadius:7,
+              padding:"8px 14px",fontFamily:"inherit",fontSize:12,fontWeight:600,cursor:"pointer"}}>
+              📂 Load Session
+              <input type="file" accept=".json" style={{display:"none"}}
+                onChange={e=>{ loadSession(e.target.files[0]); e.target.value=""; }}/>
+            </label>
+          </div>
+        </div>
+        <div style={{display:"flex",gap:0,marginTop:4,overflowX:"auto"}}>
+          {[["setup","⚙ Setup"],["arrivals","📦 Arrivals"],["demand","📋 Demand"],["plan","🚚 Plan"],["analysis","📊 Analysis"]].map(([k,l])=>(
+            <TabBtn key={k} active={tab===k} onClick={()=>setTab(k)}>{l}</TabBtn>
+          ))}
+        </div>
+      </div>
+
+      {error&&<div style={{background:C.redLight,border:`1px solid ${C.redBorder}`,margin:"12px 24px",
+        borderRadius:8,padding:"10px 14px",fontSize:12,color:C.red,display:"flex",gap:10,alignItems:"center"}}>
+        <span style={{flex:1}}>⚠ {error}</span>
+        <button onClick={()=>setError("")} style={{background:"none",border:"none",color:C.red,cursor:"pointer",fontSize:16}}>✕</button>
+      </div>}
+
+      {/* Truck detail modal */}
+      {expandedTruck!==null&&(
+        <div onClick={()=>setExpandedTruck(null)}
+          style={{position:"fixed",inset:0,background:"#00000040",zIndex:100,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+          <div onClick={e=>e.stopPropagation()}
+            style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,
+              width:"100%",maxWidth:820,maxHeight:"85vh",display:"flex",flexDirection:"column",
+              boxShadow:"0 20px 60px #00000030"}}>
+            <div style={{padding:"14px 20px",borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",gap:10}}>
+              <span style={{background:C.blueLight,color:C.blue,borderRadius:5,padding:"2px 10px",fontWeight:700,fontSize:13}}>
+                T{expandedTruck}
+              </span>
+              <span style={{color:C.textSec,fontSize:12}}>{truckRows[0]?.date} · {truckRows[0]?.destination}</span>
+              <span style={{marginLeft:"auto",color:C.amber,fontWeight:700,fontSize:12}}>
+                {Math.round(truckRows.reduce((s,r)=>s+r.qty,0)).toLocaleString()} units
+              </span>
+              <span style={{color:C.green,fontWeight:700,fontSize:12,marginLeft:12}}>
+                {truckRows.reduce((s,r)=>s+r.pallets,0).toFixed(2)} / {truckRows[0]?.truckTotal||0} pallets
+              </span>
+              <button onClick={()=>setExpandedTruck(null)}
+                style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:18,marginLeft:8}}>✕</button>
+            </div>
+
+            {/* ── SKU Aggregate Summary ── */}
+            {(()=>{
+              const agg={};
+              for(const r of truckRows){
+                if(!agg[r.sku]) agg[r.sku]={sku:r.sku,name:r.name,qty:0,pallets:0};
+                agg[r.sku].qty+=r.qty; agg[r.sku].pallets+=r.pallets;
+              }
+              const aggRows=Object.values(agg);
+              return(
+                <div style={{padding:"10px 16px",borderBottom:`1px solid ${C.border}`,background:C.bg}}>
+                  <div style={{fontSize:10,color:C.muted,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:8}}>
+                    📦 Truck Summary — {aggRows.length} SKU{aggRows.length!==1?"s":""}
+                  </div>
+                  <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+                    {aggRows.map(a=>(
+                      <div key={a.sku} style={{background:C.surface,border:`1px solid ${C.border}`,
+                        borderRadius:8,padding:"8px 14px",minWidth:180}}>
+                        <div style={{fontSize:10,color:"#7c3aed",fontFamily:"monospace",fontWeight:700}}>{a.sku}</div>
+                        <div style={{fontSize:11,color:C.textSec,marginBottom:6,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",maxWidth:200}}>{a.name}</div>
+                        <div style={{display:"flex",gap:16}}>
+                          <div><div style={{fontSize:10,color:C.muted}}>TOTAL QTY</div>
+                            <div style={{fontSize:14,fontWeight:700,color:C.amber}}>{a.qty.toLocaleString()}</div></div>
+                          <div><div style={{fontSize:10,color:C.muted}}>PALLETS</div>
+                            <div style={{fontSize:14,fontWeight:700,color:C.green}}>{a.pallets.toFixed(2)}</div></div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* ── Per-line detail ── */}
+            <div style={{overflowY:"auto",flex:1}}>
+              <div style={{fontSize:10,color:C.muted,textTransform:"uppercase",letterSpacing:"0.06em",padding:"8px 16px 4px"}}>
+                Material Plan Line Items
+              </div>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                <thead>
+                  <tr>{["SKU","Product Name","Material Plan ID","Qty","Pallets"].map(h=>(
+                    <th key={h} style={S.th}>{h}</th>
+                  ))}</tr>
+                </thead>
+                <tbody>
+                  {truckRows.map((r,i)=>(
+                    <tr key={i} style={{background:r.isSplit?"#fff7ed":i%2?C.bg:C.surface,
+                      borderLeft:r.isSplit?`3px solid ${C.amber}`:"3px solid transparent"}}>
+                      <td style={{...S.td,color:"#7c3aed",fontFamily:"monospace"}}>{r.sku}</td>
+                      <td style={{...S.td,color:C.textSec}}>{r.name}</td>
+                      <td style={{...S.td,color:C.blue,fontFamily:"monospace",fontWeight:600}}>
+                        {r.id||"—"}
+                        {r.isSplit&&<span title={`Original qty: ${r.originalQty}`}
+                          style={{marginLeft:5,fontSize:10,background:C.amber,color:"#fff",
+                          borderRadius:3,padding:"1px 4px",fontWeight:700}}>✂ SPLIT</span>}
+                      </td>
+                      <td style={{...S.td,color:C.amber,fontWeight:700}}>
+                        {r.qty}
+                        {r.isSplit&&<span style={{color:C.muted,fontSize:10,marginLeft:4}}>/ {r.originalQty}</span>}
+                      </td>
+                      <td style={{...S.td,color:C.green,fontWeight:700}}>{r.pallets.toFixed(3)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div style={{padding:"20px 24px"}}>
+
+        {/* ── SETUP ── */}
+        {tab==="setup"&&<div style={{maxWidth:980}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
+            <p style={{fontSize:11,color:C.muted,letterSpacing:"0.06em",textTransform:"uppercase",margin:0}}>Upload Data Files</p>
+            {(loadedFiles.arrivals||loadedFiles.nomenclature||loadedFiles.materialplan)&&(
+              <button onClick={()=>{
+                localStorage.removeItem(LS_KEY);
+                setMaterialPlan([]); setNomenclature({}); setArrivals([]);
+                setLoadedFiles({arrivals:null,nomenclature:null,materialplan:null});
+                setPlanGenerated(false);
+              }} style={{fontSize:11,color:C.red,background:"none",border:`1px solid ${C.red}`,
+                borderRadius:5,padding:"3px 10px",cursor:"pointer",fontFamily:"inherit"}}>
+                🗑 Clear all data
+              </button>
+            )}
+          </div>
+
+          {/* Single multi-file drop zone */}
+          <div
+            onDragOver={e=>{e.preventDefault();e.currentTarget.style.borderColor=C.blue;}}
+            onDragLeave={e=>{e.currentTarget.style.borderColor=C.border;}}
+            onDrop={e=>{e.preventDefault();e.currentTarget.style.borderColor=C.border;handleUpload(e.dataTransfer.files);}}
+            style={{border:`2px dashed ${C.border}`,borderRadius:12,padding:"28px 24px",
+              textAlign:"center",marginBottom:16,cursor:"pointer",transition:"border-color 0.15s",
+              background:C.surface,position:"relative"}}
+            onClick={()=>document.getElementById('multi-file-input').click()}>
+            <input id="multi-file-input" type="file" multiple accept=".xlsx,.xls,.xlsm"
+              style={{display:"none"}} onChange={e=>handleUpload(e.target.files)}/>
+            <div style={{fontSize:28,marginBottom:8}}>📂</div>
+            <div style={{fontWeight:700,fontSize:14,color:C.text,marginBottom:4}}>
+              Drop all 3 files here at once — or click to browse
+            </div>
+            <div style={{fontSize:12,color:C.muted}}>
+              FF&amp;E Arrival · Nomenclature · Material Plan — auto-detected
+            </div>
+          </div>
+
+          {/* Loaded file status */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:20}}>
+            {[
+              {key:"arrivals",    label:"📦 FF&E Arrival",   cols:"Planned Delivery Date · Nomenclature code · Qty"},
+              {key:"nomenclature",label:"📋 Nomenclature",   cols:"Nomenclature code · Pallet quantity, disassembled · Pallet spaces, disassembled"},
+              {key:"materialplan",label:"🗂 Material Plan",   cols:"ID · Venue cluster · Nomenclature · Required"},
+            ].map(f=>(
+              <div key={f.key} style={{...S.card,padding:12,borderLeft:`3px solid ${loadedFiles[f.key]?C.green:C.border}`}}>
+                <div style={{fontSize:11,fontWeight:700,color:loadedFiles[f.key]?C.green:C.muted,marginBottom:4}}>
+                  {loadedFiles[f.key] ? "✓ " : "○ "}{f.label}
+                </div>
+                {loadedFiles[f.key]
+                  ? <div style={{fontSize:11,color:C.textSec,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{loadedFiles[f.key]}</div>
+                  : <div style={{fontSize:10,color:C.muted}}>{f.cols}</div>
+                }
+              </div>
+            ))}
+          </div>
+
+          {/* Settings */}
+          <div style={{...S.card,marginBottom:18}}>
+            <p style={{fontSize:11,color:C.muted,letterSpacing:"0.06em",textTransform:"uppercase",marginBottom:16}}>Planning Settings</p>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(160px,1fr))",gap:16,marginBottom:20}}>
+              {[
+                {label:"Max Pallets / Truck",value:MAX_PALLETS},
+                {label:"Max Trucks / Day",value:MAX_TRUCKS_DAY},
+                {label:"Max Destinations / Day",value:MAX_DESTS_DAY},
+                {label:"Max Trucks / Dest / Day",value:MAX_TRUCKS_DEST},
+                {label:"Priority",value:"MEX → CAN (trucks)"},
+                {label:"Non-MEX/CAN dests",value:"Stay at warehouse (USA, TSE…)"},
+                {label:"Dispatch Days",value:"Weekdays only, excl. US holidays"},
+                {label:"Truck Fill",value:"FIFO — earliest arrival first"},
+              ].map(s=>(
+                <div key={s.label}>
+                  <div style={{fontSize:10,color:C.muted,marginBottom:2,textTransform:"uppercase"}}>{s.label}</div>
+                  <div style={{fontSize:13,fontWeight:700,color:C.blue}}>{s.value}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{display:"flex",gap:24,flexWrap:"wrap"}}>
+              <div>
+                <div style={{fontSize:10,color:C.muted,marginBottom:6,textTransform:"uppercase"}}>
+                  Turnaround fallback (calendar days) — only used if Arrivals has no "Ready to Ship Date" column
+                </div>
+                <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
+                  {[3,5,7,10,14].map(d=>(
+                    <button key={d} onClick={()=>handleTurnaroundChange(d)} style={btn(turnaround===d)}>{d}d</button>
+                  ))}
+                  <input type="number" min={1} max={30} value={turnaround}
+                    onChange={e=>handleTurnaroundChange(e.target.value)}
+                    style={{...S.input,width:60,textAlign:"center"}}/>
+                  <span style={{fontSize:11,color:C.muted}}>days</span>
+                </div>
+                {loadedFiles.arrivals&&arrivals.some(a=>a.readyDate&&a.arrivalDate&&a.readyDate!==nextWorkday(addDays(a.arrivalDate,turnaround)))&&(
+                  <div style={{fontSize:11,color:C.green,marginTop:6}}>✓ "Ready to Ship Date" column detected — using it directly</div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Diagnostics */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:10,marginBottom:18}}>
+            {[
+              {label:"Demand Rows",v:materialPlan.length,c:C.blue},
+              {label:"Nomenclature SKUs",v:Object.keys(nomenclature).length,c:C.blue},
+              {label:"Arrival Containers",v:arrivals.length,c:C.green},
+              {label:"Arrivals WITH Qty",v:arrivals.filter(a=>a.qty>0).length,
+                c:arrivals.length>0&&arrivals.filter(a=>a.qty>0).length===0?C.red:C.green},
+              {label:"Total Arrival Qty",v:Math.round(arrivals.reduce((s,a)=>s+(a.qty||0),0)).toLocaleString(),
+                c:arrivals.reduce((s,a)=>s+(a.qty||0),0)>0?C.green:C.red},
+              {label:"Demand Input Mode",v:materialPlan.length>0?(materialPlan.some(r=>r.inputMode==="qty")?"Units":"Pallets"):"—",c:C.textSec},
+              {label:"Total Demand Qty",v:totalDemandQty>0?Math.round(totalDemandQty).toLocaleString():"—",c:C.amber},
+              {label:"Total Demand Pal",v:totalDemandPal>0?totalDemandPal.toFixed(1):"—",c:C.amber},
+            ].map(s=>(
+              <div key={s.label} style={{...S.card,textAlign:"center",padding:14}}>
+                <div style={{fontSize:18,fontWeight:700,color:s.c}}>{s.v}</div>
+                <div style={{fontSize:10,color:C.muted,marginTop:3,textTransform:"uppercase"}}>{s.label}</div>
+              </div>
+            ))}
+          </div>
+
+          <button disabled={!canGenerate}
+            onClick={()=>{setPlanGenerated(true);setTab("plan");}}
+            style={{background:canGenerate?"linear-gradient(135deg,#2563eb,#7c3aed)":"#e2e8f0",
+              color:canGenerate?"#fff":C.muted,border:"none",borderRadius:8,padding:"12px 28px",
+              fontFamily:"inherit",fontSize:13,fontWeight:700,cursor:canGenerate?"pointer":"not-allowed"}}>
+            {canGenerate?"⚡ Generate Load Plan":"⚡ Upload FF&E Arrival + Material Plan first"}
+          </button>
+          {canGenerate&&arrivals.filter(a=>a.qty>0).length<arrivals.length&&(
+            <p style={{marginTop:8,fontSize:11,color:C.red}}>
+              ⚠ {arrivals.filter(a=>!a.qty||a.qty===0).length} arrival rows have no Qty and will be skipped by the engine.
+            </p>
+          )}
+        </div>}
+
+        {/* ── ARRIVALS ── */}
+        {tab==="arrivals"&&<div>
+          <div style={{display:"flex",gap:12,marginBottom:14,alignItems:"center",flexWrap:"wrap"}}>
+            <span style={{fontSize:12,color:C.muted}}>{arrivals.length} containers</span>
+            {arrivals.filter(a=>a.qty>0).length===0&&arrivals.length>0&&(
+              <Badge color={C.red}>⚠ No Qty found — engine cannot dispatch</Badge>
+            )}
+            {arrivals.filter(a=>a.qty>0).length>0&&(
+              <Badge color={C.green}>✓ {arrivals.filter(a=>a.qty>0).length} with qty · {Math.round(arrivals.reduce((s,a)=>s+(a.qty||0),0)).toLocaleString()} total units</Badge>
+            )}
+          </div>
+          {arrivals.length===0
+            ?<div style={{...S.card,textAlign:"center",padding:48,color:C.muted}}>No arrivals loaded.</div>
+            :<div className="tbl-scroll">
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                <thead><tr>
+                  {["#","SKU","Product Name","Container","Arrival Date ✎","Ready Date","Qty ★","Pallets"].map(h=>(
+                    <th key={h} style={{...S.th,color:h==="Qty ★"?C.amber:undefined}}>{h}</th>
+                  ))}
+                </tr></thead>
+                <tbody>
+                  {arrivals.map((a,i)=>{
+                    const nomName=nomenclature[a.sku]?.name||a.name||"";
+                    const miss=!a.qty||a.qty===0;
+                    return(
+                      <tr key={i} style={{background:miss?"#fff5f5":i%2?C.bg:C.surface}}>
+                        <td style={{...S.td,color:C.muted}}>{i+1}</td>
+                        <td style={{...S.td,color:"#7c3aed",fontFamily:"monospace"}}>{a.sku}</td>
+                        <td style={{...S.td,color:C.textSec,maxWidth:200,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{nomName}</td>
+                        <td style={{...S.td,color:C.muted,fontFamily:"monospace",fontSize:11}}>{a.container}</td>
+                        <td style={S.td}>
+                          <input type="date" value={a.arrivalDate||""} onChange={e=>updateArrivalDate(i,e.target.value)}
+                            style={{...S.input,width:130,padding:"4px 8px"}}/>
+                        </td>
+                        <td style={{...S.td,fontWeight:600}}>
+                          <span style={{color:isHoliday(a.readyDate)?C.amber:C.green}}>
+                            {a.readyDate}
+                          </span>
+                          {isHoliday(a.readyDate)&&<span style={{fontSize:10,color:C.amber,marginLeft:4}}>🏛 holiday</span>}
+                        </td>
+                        <td style={{...S.td,fontWeight:700}}>
+                          {miss?<span style={{color:C.red,fontSize:11}}>⚠ missing</span>
+                               :<span style={{color:C.amber}}>{a.qty.toLocaleString()}</span>}
+                        </td>
+                        <td style={{...S.td,color:C.muted}}>{(a.availPallets||0).toFixed(2)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>}
+        </div>}
+
+        {/* ── DEMAND ── */}
+        {tab==="demand"&&<div>
+          <div style={{display:"flex",gap:12,marginBottom:14,alignItems:"center",flexWrap:"wrap"}}>
+            <span style={{fontSize:12,color:C.muted}}>
+              {demandBySku.length} SKUs · {Math.round(totalDemandQty).toLocaleString()} units · {totalDemandPal.toFixed(1)} pallets
+            </span>
+            {Object.keys(nomenclature).length===0&&<Badge color={C.amber}>⚠ Nomenclature not loaded</Badge>}
+          </div>
+          {demandBySku.length===0
+            ?<div style={{...S.card,textAlign:"center",padding:48,color:C.muted}}>No demand loaded.</div>
+            :<div className="tbl-scroll">
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                <thead><tr>
+                  {["SKU","Product Name","Pal.Qty/unit","Pal.Spc/unit","Total Qty","Total Pallets","Destinations","Nom."].map(h=>(
+                    <th key={h} style={S.th}>{h}</th>
+                  ))}
+                </tr></thead>
+                <tbody>
+                  {demandBySku.map((d,i)=>(
+                    <tr key={i} style={{background:i%2?C.bg:C.surface}}>
+                      <td style={{...S.td,color:"#7c3aed",fontFamily:"monospace"}}>{d.sku}</td>
+                      <td style={{...S.td,color:C.text,fontWeight:500}}>{d.name}</td>
+                      <td style={{...S.td,color:C.muted}}>{d.palletQty}</td>
+                      <td style={{...S.td,color:C.muted}}>{d.palletSpc}</td>
+                      <td style={{...S.td,color:C.amber,fontWeight:700}}>{Math.round(d.totalQty).toLocaleString()}</td>
+                      <td style={{...S.td,color:C.green,fontWeight:700}}>{d.totalPallets.toFixed(3)}</td>
+                      <td style={S.td}>
+                        <div style={{display:"flex",gap:3,flexWrap:"wrap"}}>
+                          {[...d.destinations].map(dest=>(
+                            <Badge key={dest} color={getWHColor(dest)} small>{dest}</Badge>
+                          ))}
+                        </div>
+                      </td>
+                      <td style={S.td}>
+                        {d.nomFound?<Badge color={C.green} small>✓</Badge>:<Badge color={C.amber} small>raw</Badge>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr style={{background:"#f8fafc",borderTop:`2px solid ${C.border}`}}>
+                    <td colSpan={4} style={{...S.td,color:C.muted,fontWeight:600}}>TOTAL</td>
+                    <td style={{...S.td,color:C.amber,fontWeight:700}}>{Math.round(totalDemandQty).toLocaleString()}</td>
+                    <td style={{...S.td,color:C.green,fontWeight:700}}>{totalDemandPal.toFixed(2)}</td>
+                    <td colSpan={2}/>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>}
+        </div>}
+
+        {/* ── PLAN ── */}
+        {tab==="plan"&&<div>
+          {!planGenerated
+            ?<div style={{...S.card,textAlign:"center",padding:56}}>
+              <div style={{fontSize:36,marginBottom:10}}>⚡</div>
+              <div style={{color:C.muted,marginBottom:16}}>No plan generated yet.</div>
+              <button disabled={!canGenerate} onClick={()=>setPlanGenerated(true)}
+                style={{background:canGenerate?"linear-gradient(135deg,#2563eb,#7c3aed)":"#e2e8f0",
+                  color:canGenerate?"#fff":C.muted,border:"none",borderRadius:8,padding:"10px 22px",
+                  fontFamily:"inherit",fontSize:13,fontWeight:700,cursor:canGenerate?"pointer":"not-allowed"}}>
+                Generate Load Plan
+              </button>
+            </div>
+            :<>
+              {/* Truck cards */}
+              <div style={{marginBottom:16}}>
+                <div style={{fontSize:11,color:C.muted,letterSpacing:"0.05em",textTransform:"uppercase",marginBottom:10}}>
+                  {truckSummary.length} trucks · {planDates.length} dispatch days · click a card for details
+                </div>
+                <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                  {truckSummary.map(t=>(
+                    <div key={t.truckId} onClick={()=>setExpandedTruck(t.truckId)}
+                      style={{...S.card,padding:"10px 12px",cursor:"pointer",minWidth:110,
+                        border:`1px solid ${getWHColor(t.destination)}44`,
+                        background:`${getWHColor(t.destination)}08`}}>
+                      <div style={{fontSize:10,color:C.muted,marginBottom:1}}>{t.date}</div>
+                      <div style={{marginBottom:3}}>
+                        <span style={{background:C.blueLight,color:C.blue,borderRadius:3,
+                          padding:"1px 6px",fontWeight:700,fontSize:10}}>T{t.truckId}</span>
+                      </div>
+                      <div style={{fontSize:11,fontWeight:600,color:getWHColor(t.destination),
+                        overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:120,marginBottom:4}}>{t.destination}</div>
+                      <CapBar value={t.pallets}/>
+                      <div style={{fontSize:10,color:C.muted,marginTop:3}}>{t.skus.size} SKU{t.skus.size>1?"s":""}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Filters */}
+              <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap",alignItems:"center"}}>
+                <select value={planFilter.date} onChange={e=>setPlanFilter(f=>({...f,date:e.target.value}))}
+                  style={{...S.input,width:"auto"}}>
+                  <option value="">All Dates</option>
+                  {planDates.map(d=><option key={d} value={d}>{d}</option>)}
+                </select>
+                <select value={planFilter.dest} onChange={e=>setPlanFilter(f=>({...f,dest:e.target.value}))}
+                  style={{...S.input,width:"auto"}}>
+                  <option value="">All Destinations</option>
+                  {planDests.map(d=><option key={d} value={d}>{d}</option>)}
+                </select>
+                <input placeholder="Search SKU / product…" value={planFilter.sku}
+                  onChange={e=>setPlanFilter(f=>({...f,sku:e.target.value}))}
+                  style={{...S.input,width:200}}/>
+                <button onClick={()=>setPlanFilter({date:"",dest:"",sku:""})} style={btn(false)}>Clear</button>
+                <span style={{marginLeft:"auto",fontSize:12,color:C.muted}}>
+                  {filteredPlan.length} rows · {Math.round(filteredPlan.reduce((s,r)=>s+r.qty,0)).toLocaleString()} units
+                </span>
+              </div>
+
+              <div className="tbl-scroll">
+                <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                  <thead><tr>
+                    {["Date","Truck","Destination","SKU","Product Name","ID","Qty","Pallets","Truck Fill","Demand Qty","Cum.Alloc","Fulfil%"].map(h=>(
+                      <th key={h} style={S.th}>{h}</th>
+                    ))}
+                  </tr></thead>
+                  <tbody>
+                    {filteredPlan.map((r,i)=>{
+                      const pct=r.cumPct||0;
+                      const pc=pct>=100?C.green:pct>=60?C.amber:C.red;
+                      return(
+                        <tr key={i} style={{background:r.isSplit?"#fff7ed":i%2?C.bg:C.surface,
+                          borderLeft:r.isSplit?`3px solid ${C.amber}`:"3px solid transparent"}}>
+                          <td style={{...S.td,color:C.muted}}>{r.date}</td>
+                          <td style={S.td}>
+                            <span style={{background:C.blueLight,color:C.blue,borderRadius:4,
+                              padding:"2px 8px",fontWeight:700,cursor:"pointer",fontSize:11}}
+                              onClick={()=>setExpandedTruck(r.truckId)}>T{r.truckId}</span>
+                          </td>
+                          <td style={S.td}><Badge color={getWHColor(r.destination)} small>{r.destination}</Badge></td>
+                          <td style={{...S.td,color:"#7c3aed",fontFamily:"monospace",fontSize:11}}>{r.sku}</td>
+                          <td style={{...S.td,color:C.textSec,maxWidth:180,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.name}</td>
+                          <td style={{...S.td,color:C.blue,fontFamily:"monospace",fontWeight:600,fontSize:11}}>
+                            {r.id||"—"}
+                            {r.isSplit&&<span title={`Split: ${r.qty} of ${r.originalQty} original`}
+                              style={{marginLeft:4,fontSize:9,background:C.amber,color:"#fff",
+                              borderRadius:3,padding:"1px 3px",fontWeight:700,verticalAlign:"middle"}}>✂</span>}
+                          </td>
+                          <td style={{...S.td,color:C.amber,fontWeight:700}}>
+                            {r.qty}
+                            {r.isSplit&&<span style={{color:C.muted,fontSize:10,marginLeft:3}}>/{r.originalQty}</span>}
+                          </td>
+                          <td style={{...S.td,color:C.green,fontWeight:700}}>{r.pallets.toFixed(3)}</td>
+                          <td style={{...S.td,minWidth:100}}><CapBar value={r.truckTotal}/></td>
+                          <td style={{...S.td,color:C.muted}}>{Math.round(r.totalDemQty||0).toLocaleString()}</td>
+                          <td style={{...S.td,color:C.text,fontWeight:600}}>{Math.round(r.cumQty||0).toLocaleString()}</td>
+                          <td style={{...S.td,minWidth:80}}>
+                            <div style={{display:"flex",alignItems:"center",gap:5}}>
+                              <div style={{width:36,height:4,background:C.border,borderRadius:99,overflow:"hidden"}}>
+                                <div style={{width:`${Math.min(100,pct)}%`,height:"100%",background:pc,borderRadius:99}}/>
+                              </div>
+                              <span style={{fontSize:11,color:pc,fontWeight:700}}>{pct.toFixed(0)}%</span>
+                            </div>
+                          </td>
+                          <td style={{...S.td,color:C.muted,fontSize:11}}>{r.id||"—"}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                  <tfoot>
+                    <tr style={{background:"#f8fafc",borderTop:`2px solid ${C.border}`}}>
+                      <td colSpan={5} style={{...S.td,color:C.muted,fontWeight:600}}>TOTAL (filtered)</td>
+                      <td style={{...S.td,color:C.amber,fontWeight:700}}>{Math.round(filteredPlan.reduce((s,r)=>s+r.qty,0)).toLocaleString()}</td>
+                      <td style={{...S.td,color:C.green,fontWeight:700}}>{filteredPlan.reduce((s,r)=>s+r.pallets,0).toFixed(2)}</td>
+                      <td colSpan={5}/>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+            </>}
+        </div>}
+
+        {/* ── ANALYSIS ── */}
+        {tab==="analysis"&&<div>
+          {!planGenerated
+            ?<div style={{...S.card,textAlign:"center",padding:56,color:C.muted}}>Generate a plan first.</div>
+            :<>
+              {/* KPIs */}
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(120px,1fr))",gap:10,marginBottom:20}}>
+                {[
+                  {label:"Demand Qty",   v:Math.round(totalDemandQty).toLocaleString(), c:C.textSec, icon:"📦"},
+                  {label:"Alloc Qty",    v:Math.round(totalAllocQty).toLocaleString(),  c:C.green,   icon:"✅"},
+                  {label:"Demand Pal",   v:totalDemandPal.toFixed(1),                  c:C.textSec, icon:"📋"},
+                  {label:"Alloc Pal",    v:totalAllocPal.toFixed(1),                   c:C.green,   icon:"✅"},
+                  {label:"Shortage Pal", v:totalShortage.toFixed(1),                   c:totalShortage>0?C.red:C.green, icon:"⚠️"},
+                  {label:"Trucks",       v:truckSummary.length,                         c:C.blue,    icon:"🚛"},
+                  {label:"Days",         v:planDates.length,                            c:C.amber,   icon:"📅"},
+                ].map(k=>(
+                  <div key={k.label} style={{...S.card,textAlign:"center",padding:14}}>
+                    <div style={{fontSize:18,marginBottom:4}}>{k.icon}</div>
+                    <div style={{fontSize:17,fontWeight:700,color:k.c}}>{k.v}</div>
+                    <div style={{fontSize:10,color:C.muted,marginTop:3,textTransform:"uppercase"}}>{k.label}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* USA warehouse */}
+              {usaWarehouseItems.length>0&&<div style={{...S.card,marginBottom:18,border:`1px solid ${C.greenBorder}`,background:C.greenLight}}>
+                <div style={{display:"flex",gap:10,alignItems:"center",marginBottom:14,flexWrap:"wrap"}}>
+                  <div style={{fontSize:11,color:C.green,fontWeight:600,flex:1,textTransform:"uppercase"}}>🏭 Warehouse Only — not trucked (USA, TSE, other)</div>
+                  <Badge color={C.green}>{usaWarehouseItems.length} SKUs</Badge>
+                  <Badge color={C.amber}>{Math.round(usaWarehouseItems.reduce((s,d)=>s+d.requiredQty,0)).toLocaleString()} units</Badge>
+                  <Badge color={C.green}>{usaWarehouseItems.reduce((s,d)=>s+d.requiredPallets,0).toFixed(1)} pallets</Badge>
+                </div>
+                <div className="tbl-scroll">
+                  <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                    <thead><tr>
+                      {["Destination","SKU","Product Name","Req Qty","Req Pallets"].map(h=>(
+                        <th key={h} style={S.th}>{h}</th>
+                      ))}
+                    </tr></thead>
+                    <tbody>
+                      {usaWarehouseItems.map((d,i)=>(
+                        <tr key={i} style={{background:i%2?"#ecfdf5":C.surface}}>
+                          <td style={S.td}><Badge color={getWHColor(d.destination)} small>{d.destination}</Badge></td>
+                          <td style={{...S.td,color:"#7c3aed",fontFamily:"monospace"}}>{d.sku}</td>
+                          <td style={{...S.td,color:C.textSec}}>{d.name}</td>
+                          <td style={{...S.td,color:C.amber,fontWeight:700}}>{Math.round(d.requiredQty).toLocaleString()}</td>
+                          <td style={{...S.td,color:C.green}}>{d.requiredPallets.toFixed(3)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>}
+
+              {/* Shortage table */}
+              <div style={{...S.card,marginBottom:18}}>
+                <div style={{display:"flex",gap:8,marginBottom:14,alignItems:"center",flexWrap:"wrap"}}>
+                  <div style={{fontSize:11,color:C.muted,fontWeight:600,flex:1,textTransform:"uppercase"}}>Demand vs Allocation — Destination × SKU</div>
+                  {[["all","All"],["shortage","Shortages"],["fulfilled","Fulfilled"]].map(([k,l])=>(
+                    <button key={k} onClick={()=>setShowShortages(k)} style={btn(showShortages===k)}>{l}</button>
+                  ))}
+                </div>
+                <div className="tbl-scroll">
+                  <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                    <thead><tr>
+                      {["Destination","SKU","Product","Req Qty","Alloc Qty","Short Qty","Req Pal","Alloc Pal","Short Pal","Fill%"].map(h=>(
+                        <th key={h} style={S.th}>{h}</th>
+                      ))}
+                    </tr></thead>
+                    <tbody>
+                      {filteredShortages.map((s,i)=>{
+                        const fp=s.requiredPallets>0?Math.min(100,(s.allocPallets/s.requiredPallets)*100):100;
+                        const hasShort=s.shortagePallets>0.001;
+                        return(
+                          <tr key={i} style={{background:hasShort?C.redLight:i%2?C.bg:C.surface}}>
+                            <td style={S.td}><Badge color={getWHColor(s.destination)} small>{s.destination}</Badge></td>
+                            <td style={{...S.td,color:"#7c3aed",fontFamily:"monospace"}}>{s.sku}</td>
+                            <td style={{...S.td,color:C.textSec,maxWidth:150,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{s.name}</td>
+                            <td style={{...S.td,color:C.amber,fontWeight:700}}>{Math.round(s.requiredQty).toLocaleString()}</td>
+                            <td style={{...S.td,color:C.green}}>{Math.round(s.allocQty).toLocaleString()}</td>
+                            <td style={{...S.td,color:s.shortageQty>0.5?C.red:C.muted,fontWeight:700}}>
+                              {s.shortageQty>0.5?`▼ ${Math.round(s.shortageQty).toLocaleString()}`:"—"}
+                            </td>
+                            <td style={{...S.td,color:C.muted}}>{s.requiredPallets.toFixed(2)}</td>
+                            <td style={{...S.td,color:C.green}}>{s.allocPallets.toFixed(2)}</td>
+                            <td style={{...S.td,color:hasShort?C.red:C.muted,fontWeight:700}}>
+                              {hasShort?`▼ ${s.shortagePallets.toFixed(2)}`:"—"}
+                            </td>
+                            <td style={{...S.td,minWidth:90}}>
+                              <div style={{display:"flex",alignItems:"center",gap:5}}>
+                                <div style={{flex:1,height:4,background:C.border,borderRadius:99,overflow:"hidden"}}>
+                                  <div style={{width:`${fp}%`,height:"100%",borderRadius:99,
+                                    background:fp>=100?C.green:fp>60?C.amber:C.red}}/>
+                                </div>
+                                <span style={{fontSize:10,color:C.muted,minWidth:28}}>{fp.toFixed(0)}%</span>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* Destination summary */}
+              <div style={{...S.card}}>
+                <p style={{fontSize:11,color:C.muted,fontWeight:600,textTransform:"uppercase",marginBottom:14}}>Summary by Destination (MEX + CAN)</p>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(190px,1fr))",gap:12}}>
+                  {planDests.map(dest=>{
+                    const dT=truckSummary.filter(t=>t.destination===dest);
+                    const dPal=dT.reduce((s,t)=>s+t.pallets,0);
+                    const dQty=dT.reduce((s,t)=>s+t.qty,0);
+                    const dDemPal=demandForPlan.filter(d=>d.destination===dest).reduce((s,d)=>s+d.requiredPallets,0);
+                    const dDemQty=demandForPlan.filter(d=>d.destination===dest).reduce((s,d)=>s+d.requiredQty,0);
+                    const fp=dDemPal>0?Math.min(100,(dPal/dDemPal)*100):100;
+                    const wc=getWHColor(dest);
+                    return(
+                      <div key={dest} style={{background:C.bg,border:`1px solid ${wc}33`,borderRadius:8,padding:14}}>
+                        <div style={{fontSize:12,fontWeight:700,color:wc,marginBottom:8,
+                          overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{dest}</div>
+                        {[["Trucks",dT.length,C.text],
+                          ["Alloc Qty",Math.round(dQty).toLocaleString(),C.amber],
+                          ["Demand Qty",Math.round(dDemQty).toLocaleString(),C.muted],
+                          ["Alloc Pal",dPal.toFixed(1),C.green],
+                          ["Demand Pal",dDemPal.toFixed(1),C.muted],
+                        ].map(([l,v,c])=>(
+                          <div key={l} style={{display:"flex",justifyContent:"space-between",fontSize:11,color:C.muted,marginBottom:3}}>
+                            <span>{l}</span><span style={{color:c,fontWeight:600}}>{v}</span>
+                          </div>
+                        ))}
+                        <div style={{marginTop:8}}>
+                          <div style={{height:3,background:C.border,borderRadius:99,overflow:"hidden"}}>
+                            <div style={{width:`${fp}%`,height:"100%",background:fp>=100?C.green:fp>60?C.amber:C.red,borderRadius:99}}/>
+                          </div>
+                          <div style={{fontSize:10,color:C.muted,marginTop:3,textAlign:"right"}}>{fp.toFixed(0)}% fill</div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </>}
+        </div>}
+
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
